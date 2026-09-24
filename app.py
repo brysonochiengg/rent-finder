@@ -1,6 +1,8 @@
 from io import BytesIO
 import re
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
+from copy import deepcopy
 
 import pandas as pd
 import requests
@@ -219,17 +221,70 @@ def pct(value):
 
 MONTHS = (
     "January|February|March|April|May|June|July|August|"
-    "September|October|November|December|Jan|Feb|Mar|Apr|"
+    "September|October|November|December|Jan|Feb|Mar|Apr|May|"
     "Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec"
 )
 
 DATE_PATTERNS = [
+    # January 29, 2026 / March 01, 2026 / April 1st 2018
     rf"\b(?:{MONTHS})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?[,]?\s+\d{{4}}\b",
+    # 1 day of July 2020
+    rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+day\s+of\s+(?:{MONTHS})\.?\s+\d{{4}}\b",
+    # 3/1/2026, 07-01-2020
     r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+    # 2026-03-01
     r"\b\d{4}-\d{1,2}-\d{1,2}\b",
 ]
 
 DATE_RE = re.compile("|".join(f"(?:{p})" for p in DATE_PATTERNS), re.IGNORECASE)
+
+LEASE_CONTEXT_WORDS = (
+    "lease", "term", "begin", "commence", "commencement", "start", "ending",
+    "end", "terminate", "termination", "expiration", "expires", "dated",
+    "effective", "renewal", "lease year", "signature", "signed", "date:"
+)
+PERSON_CONTEXT_WORDS = (
+    "dob", "birth", "born", "family", "occupant", "resident", "age"
+)
+
+
+def _all_docx_paragraphs(doc):
+    """Yield normal, table, header, and footer paragraphs."""
+    seen = set()
+
+    def emit_paragraph(p):
+        key = id(p._p)
+        if key not in seen:
+            seen.add(key)
+            return p
+        return None
+
+    for p in doc.paragraphs:
+        item = emit_paragraph(p)
+        if item is not None:
+            yield item
+
+    def walk_table(table):
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    item = emit_paragraph(p)
+                    if item is not None:
+                        yield item
+                for nested in cell.tables:
+                    yield from walk_table(nested)
+
+    for table in doc.tables:
+        yield from walk_table(table)
+
+    for section in doc.sections:
+        for container in (section.header, section.footer):
+            for p in container.paragraphs:
+                item = emit_paragraph(p)
+                if item is not None:
+                    yield item
+            for table in container.tables:
+                yield from walk_table(table)
 
 
 def extract_lease_text(uploaded_file):
@@ -242,13 +297,7 @@ def extract_lease_text(uploaded_file):
 
     elif suffix == ".docx":
         doc = Document(BytesIO(raw))
-        chunks = [p.text for p in doc.paragraphs]
-
-        for table in doc.tables:
-            for row in table.rows:
-                chunks.append(" | ".join(cell.text for cell in row.cells))
-
-        text = "\n".join(chunks)
+        text = "\n".join(p.text for p in _all_docx_paragraphs(doc))
 
     elif suffix == ".txt":
         text = raw.decode("utf-8", errors="replace")
@@ -261,72 +310,131 @@ def extract_lease_text(uploaded_file):
             "No readable text was found. Scanned/image-only PDFs are not supported "
             "in this version."
         )
-
     return text
 
 
-def find_dates(text):
-    dates = []
-    seen = set()
+def _context_for_match(text, match, radius=100):
+    left = max(0, match.start() - radius)
+    right = min(len(text), match.end() + radius)
+    return " ".join(text[left:right].split())
 
+
+def classify_date_context(context):
+    c = context.lower()
+    if any(word in c for word in PERSON_CONTEXT_WORDS):
+        # Birth dates should never be selected automatically.
+        return "Personal / DOB", False
+    if any(word in c for word in LEASE_CONTEXT_WORDS):
+        return "Lease-related", True
+    return "Review needed", False
+
+
+def find_dates_with_context(text):
+    found = []
+    seen = set()
     for match in DATE_RE.finditer(text):
         value = match.group(0)
         key = value.lower()
-
-        if key not in seen:
-            seen.add(key)
-            dates.append(value)
-
-    return dates
-
-
-def replace_dates(text, replacements):
-    result = text
-
-    # Replace longer strings first.
-    for old, new in sorted(
-        replacements.items(),
-        key=lambda item: len(item[0]),
-        reverse=True,
-    ):
-        result = re.sub(
-            re.escape(old),
-            new,
-            result,
-            flags=re.IGNORECASE,
-        )
-
-    return result
+        if key in seen:
+            continue
+        seen.add(key)
+        context = _context_for_match(text, match)
+        category, recommended = classify_date_context(context)
+        found.append({
+            "value": value,
+            "context": context,
+            "category": category,
+            "recommended": recommended,
+        })
+    return found
 
 
-def build_docx(text, source_name):
-    doc = Document()
-    doc.add_heading("Updated Lease Draft", level=1)
+def _replace_text_preserve_runs(paragraph, replacements):
+    """
+    Replace text while keeping paragraph formatting as intact as possible.
+    Handles dates split across Word runs by rebuilding only the affected
+    paragraph's visible text into the first run.
+    """
+    original = paragraph.text
+    updated = original
+    for old, new in sorted(replacements.items(), key=lambda x: len(x[0]), reverse=True):
+        updated = re.sub(re.escape(old), new, updated, flags=re.IGNORECASE)
 
-    p = doc.add_paragraph()
-    p.add_run("Source file: ").bold = True
-    p.add_run(source_name)
+    if updated == original:
+        return False
 
-    p = doc.add_paragraph()
-    p.add_run("Generated: ").bold = True
-    p.add_run(date.today().strftime("%B %d, %Y"))
+    if paragraph.runs:
+        paragraph.runs[0].text = updated
+        for run in paragraph.runs[1:]:
+            run.text = ""
+    else:
+        paragraph.add_run(updated)
+    return True
 
-    warning = doc.add_paragraph()
-    run = warning.add_run(
-        "DRAFT FOR REVIEW — Dates were automatically updated. "
-        "Review all terms before signing or relying on this document."
-    )
-    run.bold = True
 
-    doc.add_paragraph("")
-
-    for line in text.splitlines():
-        doc.add_paragraph(line)
+def replace_dates_in_docx(raw_bytes, replacements):
+    doc = Document(BytesIO(raw_bytes))
+    changed = 0
+    for paragraph in _all_docx_paragraphs(doc):
+        if _replace_text_preserve_runs(paragraph, replacements):
+            changed += 1
 
     output = BytesIO()
     doc.save(output)
     output.seek(0)
+    return output.getvalue(), changed
+
+
+def replace_dates_in_text(text, replacements):
+    result = text
+    for old, new in sorted(replacements.items(), key=lambda x: len(x[0]), reverse=True):
+        result = re.sub(re.escape(old), new, result, flags=re.IGNORECASE)
+    return result
+
+
+def build_docx_from_text(text, source_name):
+    doc = Document()
+    doc.add_heading("Updated Lease Draft", level=1)
+    p = doc.add_paragraph()
+    p.add_run("Source file: ").bold = True
+    p.add_run(source_name)
+    p = doc.add_paragraph()
+    p.add_run("Generated: ").bold = True
+    p.add_run(date.today().strftime("%B %d, %Y"))
+    warning = doc.add_paragraph()
+    warning.add_run(
+        "DRAFT FOR REVIEW — Review every changed date and all lease terms before signing."
+    ).bold = True
+    doc.add_paragraph("")
+    for line in text.splitlines():
+        doc.add_paragraph(line)
+    output = BytesIO()
+    doc.save(output)
+    output.seek(0)
     return output.getvalue()
+
+
+def format_replacement_date(chosen_date, original):
+    """Keep the replacement close to the original date style."""
+    if re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", original):
+        return chosen_date.strftime("%Y-%m-%d")
+    if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", original):
+        return f"{chosen_date.month}/{chosen_date.day}/{chosen_date.year}"
+    if re.fullmatch(r"\d{1,2}-\d{1,2}-\d{2,4}", original):
+        return f"{chosen_date.month:02d}-{chosen_date.day:02d}-{chosen_date.year}"
+    if re.search(r"\bday\s+of\b", original, re.I):
+        return f"{chosen_date.day} day of {chosen_date.strftime('%B %Y')}"
+    if re.search(r"\d{1,2}(st|nd|rd|th)", original, re.I):
+        d = chosen_date.day
+        suffix = "th" if 10 <= d % 100 <= 20 else {1:"st",2:"nd",3:"rd"}.get(d % 10, "th")
+        return f"{chosen_date.strftime('%B')} {d}{suffix} {chosen_date.year}"
+    # Preserve zero-padded day if original used it.
+    day_match = re.search(r"\b(\d{1,2})\b", original)
+    padded = bool(day_match and len(day_match.group(1)) == 2 and day_match.group(1).startswith("0"))
+    day = f"{chosen_date.day:02d}" if padded else str(chosen_date.day)
+    return f"{chosen_date.strftime('%B')} {day}, {chosen_date.year}"
+
+
 
 
 # =========================================================
@@ -456,8 +564,8 @@ def render_lease_updater():
         <div class="hero">
             <h1>📄 Lease Updater</h1>
             <p>
-                Upload a lease, detect its dates, and generate an updated draft
-                using today's date.
+                Upload a lease, review the dates found, and create a new draft
+                without overwriting the original document.
             </p>
         </div>
         """,
@@ -465,125 +573,126 @@ def render_lease_updater():
     )
 
     st.warning(
-        "This creates a new draft and does not alter the original lease. "
-        "Changing lease dates can affect legal rights and obligations, so review "
-        "the generated document before signing or using it."
+        "DRAFTING TOOL — Changing lease dates can change legal rights and obligations. "
+        "The app keeps the original file untouched and requires you to review the "
+        "dates before generating a new draft."
     )
 
     uploaded = st.file_uploader(
         "Upload lease",
-        type=["pdf", "docx", "txt"],
+        type=["docx", "pdf", "txt"],
         accept_multiple_files=False,
     )
 
     if not uploaded:
-        st.info("Upload a PDF, DOCX, or TXT lease to begin.")
+        st.info("Upload a DOCX, PDF, or TXT lease to begin. DOCX preserves the original layout best.")
         return
 
     try:
-        with st.spinner("Reading lease..."):
+        raw = uploaded.getvalue()
+        with st.spinner("Reading lease and detecting dates..."):
             text = extract_lease_text(uploaded)
+            detected = find_dates_with_context(text)
 
-        dates = find_dates(text)
+        st.success(f"Loaded {uploaded.name} — found {len(detected)} unique date(s).")
 
-        st.success(f"Loaded {uploaded.name}")
+        if Path(uploaded.name).suffix.lower() == ".pdf":
+            st.info(
+                "PDF text can be detected, but the generated Word draft cannot preserve the "
+                "original PDF layout. Upload the original DOCX when available for best results."
+            )
 
         with st.expander("Preview extracted lease text"):
-            st.text_area(
-                "Lease text",
-                value=text,
-                height=350,
-                disabled=True,
-                label_visibility="collapsed",
-            )
+            st.text_area("Lease text", text, height=300, disabled=True, label_visibility="collapsed")
 
-        if not dates:
-            st.info(
-                "No standard-form dates were detected in this lease."
-            )
+        if not detected:
+            st.info("No supported date formats were detected.")
             return
 
-        today_default = date.today().strftime("%B %d, %Y")
-
-        st.subheader("Dates detected")
+        st.subheader("1. Review detected dates")
         st.caption(
-            "Choose which dates should be replaced. Each selected date defaults "
-            "to today's date."
+            "Lease-related dates are preselected. Personal/DOB dates are intentionally left unselected."
         )
 
         replacements = {}
+        for i, item in enumerate(detected):
+            with st.container(border=True):
+                c1, c2 = st.columns([1.15, 1])
+                with c1:
+                    st.markdown(f"**{item['value']}**")
+                    st.caption(f"{item['category']} · …{item['context']}…")
+                    selected = st.checkbox(
+                        "Update this date",
+                        value=item["recommended"],
+                        key=f"lease_select_{uploaded.name}_{i}",
+                    )
+                with c2:
+                    chosen = st.date_input(
+                        "New date",
+                        value=date.today(),
+                        key=f"lease_newdate_{uploaded.name}_{i}",
+                        disabled=not selected,
+                    )
+                    if selected:
+                        replacements[item["value"]] = format_replacement_date(chosen, item["value"])
 
-        for i, old_date in enumerate(dates):
-            st.markdown('<div class="lease-card">', unsafe_allow_html=True)
-
-            col1, col2 = st.columns([1, 2])
-
-            with col1:
-                selected = st.checkbox(
-                    f"Update {old_date}",
-                    value=True,
-                    key=f"lease_date_check_{i}",
-                )
-
-            with col2:
-                new_date = st.text_input(
-                    "Replacement date",
-                    value=today_default,
-                    key=f"lease_date_value_{i}",
-                    disabled=not selected,
-                )
-
-            if selected and new_date.strip():
-                replacements[old_date] = new_date.strip()
-
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        st.divider()
+        st.subheader("2. Confirm changes")
+        if replacements:
+            preview_rows = [{"Current date": old, "New date": new} for old, new in replacements.items()]
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("Select at least one lease date above.")
 
         if st.button(
             "Generate updated lease draft",
             type="primary",
             use_container_width=True,
+            disabled=not bool(replacements),
         ):
-            if not replacements:
-                st.error("Select at least one date to update.")
-                return
+            suffix = Path(uploaded.name).suffix.lower()
 
-            updated_text = replace_dates(text, replacements)
-            updated_docx = build_docx(updated_text, uploaded.name)
+            if suffix == ".docx":
+                output_bytes, changed_paragraphs = replace_dates_in_docx(raw, replacements)
+                if changed_paragraphs == 0:
+                    raise ValueError(
+                        "The dates were detected, but Word stored them in a structure that could not "
+                        "be safely replaced. Please send this document for inspection."
+                    )
+            else:
+                updated_text = replace_dates_in_text(text, replacements)
+                output_bytes = build_docx_from_text(updated_text, uploaded.name)
+                changed_paragraphs = None
 
-            st.session_state["updated_lease_text"] = updated_text
-            st.session_state["updated_lease_docx"] = updated_docx
+            st.session_state["updated_lease_docx"] = output_bytes
             st.session_state["updated_lease_name"] = (
-                f"{Path(uploaded.name).stem}_updated_{date.today().isoformat()}.docx"
+                f"{Path(uploaded.name).stem}_UPDATED_DRAFT_{date.today().isoformat()}.docx"
             )
+            st.session_state["updated_lease_changes"] = replacements.copy()
 
-        if "updated_lease_text" in st.session_state:
-            st.success("Updated lease draft created.")
-
-            st.subheader("Preview updated draft")
-
-            st.text_area(
-                "Updated lease",
-                value=st.session_state["updated_lease_text"],
-                height=400,
-                disabled=True,
-                label_visibility="collapsed",
+        if "updated_lease_docx" in st.session_state:
+            st.success("Updated draft created. The original uploaded lease was not changed.")
+            st.subheader("3. Download")
+            st.write("Changes included in this draft:")
+            st.dataframe(
+                pd.DataFrame([
+                    {"Original": k, "Replacement": v}
+                    for k, v in st.session_state["updated_lease_changes"].items()
+                ]),
+                use_container_width=True,
+                hide_index=True,
             )
-
             st.download_button(
                 "Download updated lease draft (.docx)",
                 data=st.session_state["updated_lease_docx"],
                 file_name=st.session_state["updated_lease_name"],
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "wordprocessingml.document"
-                ),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 use_container_width=True,
             )
 
     except Exception as exc:
         st.error(str(exc))
+
+
 
 
 # =========================================================
