@@ -10,7 +10,7 @@ import streamlit as st
 from pypdf import PdfReader
 from docx import Document
 from neighborhood_report import render_neighborhood_report
-from moving_assistant import render_moving_assistant
+from moving_assistant import render_moving_assistant, render_inline_location_analysis
 
 # -------------------------------------------------
 # Public rental data
@@ -550,6 +550,17 @@ def render_rent_finder():
 
         st.subheader("Rent trend")
         st.line_chart(history, use_container_width=True)
+
+        # Automatically show neighborhood pros and cons for the SAME location
+        # entered in Rent Finder. No second search or separate page required.
+        render_inline_location_analysis(
+            zip_code=zip_code,
+            resolved_location=resolved_location,
+            typical_rent=latest_value,
+            yoy_change=yoy_change,
+            observation_month=latest_date.strftime("%B %Y"),
+        )
+
 
     except Exception as exc:
         st.error(str(exc))
