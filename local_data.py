@@ -7,6 +7,8 @@ HEADERS = {'User-Agent': 'RentFinder/2.1 (public neighborhood research app)'}
 OVERPASS_SERVERS = [
     'https://overpass.kumi.systems/api/interpreter',
     'https://overpass-api.de/api/interpreter',
+    'https://overpass.nchc.org.tw/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
 ]
 
 
@@ -52,10 +54,15 @@ def nearby_places(lat,lon):
     );out center tags;'''
     errors=[]
     for endpoint in OVERPASS_SERVERS:
+      for method in ('GET', 'POST'):
         try:
-            r=requests.post(endpoint,data={'data':q},headers=HEADERS,timeout=32)
+            if method == 'GET':
+                r=requests.get(endpoint,params={'data':q},headers=HEADERS,timeout=42)
+            else:
+                r=requests.post(endpoint,data={'data':q},headers=HEADERS,timeout=42)
             r.raise_for_status()
-            elements=r.json()['elements']
+            payload=r.json()
+            elements=payload['elements']
             result={'Transportation':[],'Grocery stores':[],'Schools and colleges':[]}
             seen=set()
             for item in elements:
@@ -78,7 +85,7 @@ def nearby_places(lat,lon):
             for group in result: result[group].sort(key=lambda x:x[2])
             return result
         except Exception as exc:
-            errors.append(f'{endpoint.split("/")[2]}: {type(exc).__name__} ({str(exc)[:90]})')
+            errors.append(f'{endpoint.split("/")[2]} [{method}]: {type(exc).__name__} ({str(exc)[:90]})')
     raise RuntimeError('; '.join(errors))
 
 
