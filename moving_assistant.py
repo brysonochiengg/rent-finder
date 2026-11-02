@@ -1,4 +1,3 @@
-
 from io import BytesIO
 from datetime import date
 import streamlit as st
@@ -122,3 +121,98 @@ def render_moving_assistant(resolver, load_zillow_rent_data, lookup_zip, date_co
     st.download_button("Download moving report (.docx)",report_docx(results,priorities),
         file_name=f"moving_report_{date.today().isoformat()}.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _inline_neighborhood_data(zip_code):
+    """Retrieve only public area-level data; tolerate individual source outages."""
+    from neighborhood_report import census_profile, geocode_zip, nearby_osm
+    census, nearby, issues = {}, {}, []
+    try:
+        census = census_profile(zip_code) or {}
+    except Exception:
+        issues.append("Census neighborhood statistics are temporarily unavailable.")
+    try:
+        geo = geocode_zip(zip_code)
+        if geo.get("lat") is not None and geo.get("lon") is not None:
+            nearby = nearby_osm(geo["lat"], geo["lon"], 2000) or {}
+        else:
+            issues.append("Could not locate a ZIP centroid for nearby amenities.")
+    except Exception:
+        issues.append("Nearby amenity information is temporarily unavailable.")
+    return census, nearby, issues
+
+
+def render_inline_location_analysis(zip_code, resolved_location, typical_rent, yoy_change, observation_month):
+    """Called immediately after the RentFinder rent trend chart."""
+    st.divider()
+    st.subheader("📍 Location pros & cons")
+    st.caption(
+        f"Automatically generated for {resolved_location} (ZIP {zip_code}), "
+        "using the same location as the rent chart. "
+        "ZIP-level information may not describe the exact street or building."
+    )
+    with st.spinner("Checking available neighborhood data..."):
+        census, nearby, issues = _inline_neighborhood_data(str(zip_code))
+
+    pros, cons, context = [], [], []
+    median_gross = census.get("median_gross_rent")
+    if median_gross and typical_rent:
+        context.append(
+            f"Zillow typical asking rent: ${typical_rent:,.0f} ({observation_month}); "
+            f"Census median gross rent: ${median_gross:,.0f}. "
+            "These are different measures and should not be treated as identical."
+        )
+    if yoy_change is not None:
+        if yoy_change <= -2:
+            pros.append(f"Typical asking rent is down {abs(yoy_change):.1f}% year over year, which may help renters.")
+        elif yoy_change >= 5:
+            cons.append(f"Typical asking rent is up {yoy_change:.1f}% year over year, suggesting rising housing costs.")
+        else:
+            context.append(f"Typical asking rent changed {yoy_change:+.1f}% year over year.")
+
+    transit_share = census.get("public_transit_pct")
+    if transit_share is not None:
+        context.append(
+            f"{transit_share:.1f}% of area workers commute by public transportation "
+            "(Census estimate; not a transit quality score)."
+        )
+    transit = nearby.get("transit") if isinstance(nearby, dict) else None
+    if isinstance(transit, list):
+        if len(transit) >= 3:
+            pros.append(f"{len(transit)} mapped public-transit features found within 2 km of the ZIP centroid.")
+        elif len(transit) == 0:
+            cons.append("No transit features were returned within 2 km of the ZIP centroid; mapping may be incomplete.")
+        else:
+            context.append(f"{len(transit)} mapped transit feature(s) within 2 km of the ZIP centroid.")
+    schools = nearby.get("schools") if isinstance(nearby, dict) else None
+    if isinstance(schools, list):
+        context.append(
+            f"{len(schools)} mapped school or college feature(s) within 2 km "
+            "(not school ratings or enrollment eligibility)."
+        )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### ✅ Potential advantages")
+        if pros:
+            for item in pros: st.success(item)
+        else:
+            st.info("No clear advantages supported by the currently available data.")
+    with col2:
+        st.markdown("#### ⚠️ Potential drawbacks")
+        if cons:
+            for item in cons: st.warning(item)
+        else:
+            st.info("No clear drawbacks supported by the currently available data.")
+
+    with st.expander("More local context, sources & limitations", expanded=True):
+        for item in context: st.write("• " + item)
+        for issue in issues: st.caption(issue)
+        st.caption(
+            "Sources: Zillow Research ZORI rent history, Census Reporter / American Community Survey "
+            "ZIP-level estimates, and OpenStreetMap / Overpass mapped amenities. "
+            "Nearby features are measured around a ZIP centroid, not the precise address. "
+            "This is not a safety rating; crime, schools, flood risk, commute time, and "
+            "actual apartment condition require separate verification."
+        )
+    st.caption("Want to compare locations or add your budget? Open ⚖️ Moving Decision Assistant in the sidebar.")
