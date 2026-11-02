@@ -10,7 +10,8 @@ import streamlit as st
 from pypdf import PdfReader
 from docx import Document
 from neighborhood_report import render_neighborhood_report
-from moving_assistant import render_moving_assistant, render_inline_location_analysis
+from moving_assistant import render_moving_assistant
+from local_data import render_inline_location_analysis
 
 # -------------------------------------------------
 # Public rental data
