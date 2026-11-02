@@ -10,6 +10,7 @@ import streamlit as st
 from pypdf import PdfReader
 from docx import Document
 from neighborhood_report import render_neighborhood_report
+from moving_assistant import render_moving_assistant
 
 # -------------------------------------------------
 # Public rental data
@@ -707,6 +708,7 @@ page = st.sidebar.radio(
         "🏠 Rent Finder",
         "📄 Lease Updater",
         "📊 Neighborhood Report",
+        "⚖️ Moving Decision Assistant",
     ],
 )
 
@@ -714,8 +716,10 @@ if page == "🏠 Rent Finder":
     render_rent_finder()
 elif page == "📄 Lease Updater":
     render_lease_updater()
-else:
+elif page == "📊 Neighborhood Report":
     render_neighborhood_report(resolve_location, load_zillow_rent_data, lookup_zip, date_columns)
+else:
+    render_moving_assistant(resolve_location, load_zillow_rent_data, lookup_zip, date_columns)
 
 st.sidebar.caption(
     "Rent data: Zillow Research ZORI. "
